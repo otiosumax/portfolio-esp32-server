@@ -26,29 +26,47 @@ REST API сервер на ESP32-S3 (Freenove ESP32 S3 WROOM, Arduino framework)
 | ------------------ | ------------- | ------------------------------------------ | ----- |
 | `GET`              | `/projects`   | Список всех проектов                       | 200   |
 | `GET`              | `/projects/:id` | Один проект                              | 200   |
-| `PUT`              | `/projects`   | Создать проект (id выдаёт сервер)          | 201   |
+| `PUT`              | `/projects`   | Создать проект                             | 201   |
 | `PUT`              | `/projects/:id` | Обновить проект (можно частично)         | 200   |
 | `DELETE`           | `/projects/:id` | Удалить проект                           | 204   |
 
 Ошибки: `400` — невалидное тело, `404` — проект/путь не найден,
-`405` — метод не поддерживается. Формат ошибки: `{"error": "..."}`.
+`405` — метод не поддерживается, `409` — id уже занят при создании.
+Формат ошибки: `{"error": "..."}`.
 
 ### Модель проекта
 
+```ts
+type Project = {
+  id: string;
+  title: string;
+  tags: string[];
+  description: string[];
+  githubLink: string;
+  imageURL: string;
+};
+```
+
+- `id` — строка. При создании его можно не передавать: тогда сервер сгенерирует
+  случайный. Если передать свой `id` и он уже занят — вернётся `409`.
+- При создании обязателен только `title`.
+- При обновлении передаются только изменяемые поля; для массивов `tags` и
+  `description` присланное значение заменяет массив целиком, отсутствующие поля
+  сохраняются.
+- `id` через тело запроса не меняется — он берётся из URL.
+
+### Пример объекта
+
 ```json
 {
-  "id": 1,
+  "id": "a1b2c3d4e5f60718",
   "title": "Smart Home",
-  "description": "Умный дом на ESP32",
+  "tags": ["esp32", "iot", "platformio"],
+  "description": ["Умный дом на ESP32.", "Датчики + MQTT."],
   "githubLink": "https://github.com/me/smart-home",
   "imageURL": "https://example.com/preview.png"
 }
 ```
-
-- При создании `id` можно не передавать (или передавать — он игнорируется,
-  сервер выдаёт свой автоинкрементный).
-- При создании обязателен только `title`.
-- При обновлении передаются только изменяемые поля, остальные сохраняются.
 
 ## Примеры (curl)
 
@@ -56,18 +74,21 @@ REST API сервер на ESP32-S3 (Freenove ESP32 S3 WROOM, Arduino framework)
 # Список проектов
 curl http://portfolio-server.local/projects
 
-# Создать проект
+# Создать проект (id сгенерируется автоматически)
 curl -X PUT http://portfolio-server.local/projects \
   -H "Content-Type: application/json" \
-  -d '{"title":"Smart Home","description":"Умный дом на ESP32",
+  -d '{"title":"Smart Home",
+       "tags":["esp32","iot"],
+       "description":["Умный дом на ESP32.","Датчики + MQTT."],
        "githubLink":"https://github.com/me/smart-home",
        "imageURL":"https://example.com/preview.png"}'
 
-# Обновить только описание проекта #1
-curl -X PUT http://portfolio-server.local/projects/1 \
+# Обновить только теги и описание проекта
+curl -X PUT http://portfolio-server.local/projects/a1b2c3d4e5f60718 \
   -H "Content-Type: application/json" \
-  -d '{"description":"Новое описание"}'
+  -d '{"tags":["esp32","home-assistant"],
+       "description":["Переписал на Home Assistant."]}'
 
-# Удалить проект #1
-curl -X DELETE http://portfolio-server.local/projects/1
+# Удалить проект
+curl -X DELETE http://portfolio-server.local/projects/a1b2c3d4e5f60718
 ```

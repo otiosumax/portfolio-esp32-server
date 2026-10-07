@@ -2,6 +2,9 @@
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <esp_system.h>
+
+#include "ProjectJson.h"
 
 bool ProjectStore::begin(const char* path) {
   path_ = path;
@@ -14,7 +17,7 @@ bool ProjectStore::begin(const char* path) {
   return load();
 }
 
-const Project* ProjectStore::find(uint32_t id) const {
+const Project* ProjectStore::find(const String& id) const {
   for (const Project& p : projects_) {
     if (p.id == id) {
       return &p;
@@ -23,7 +26,7 @@ const Project* ProjectStore::find(uint32_t id) const {
   return nullptr;
 }
 
-Project* ProjectStore::find(uint32_t id) {
+Project* ProjectStore::find(const String& id) {
   for (Project& p : projects_) {
     if (p.id == id) {
       return &p;
@@ -32,28 +35,39 @@ Project* ProjectStore::find(uint32_t id) {
   return nullptr;
 }
 
-Project ProjectStore::create(const String& title, const String& description,
-                             const String& githubLink,
-                             const String& imageURL) {
-  Project p;
-  p.id = nextId_++;
-  p.title = title;
-  p.description = description;
-  p.githubLink = githubLink;
-  p.imageURL = imageURL;
-
-  projects_.push_back(p);
-  save();
-  return p;
+String ProjectStore::generateId() const {
+  // 64-битный случайный id в hex; при коллизии пробуем ещё раз.
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%08x%08x", esp_random(), esp_random());
+    if (!find(String(buf))) {
+      return String(buf);
+    }
+  }
+  return String();
 }
 
-bool ProjectStore::update(uint32_t id, const Project& updated) {
+bool ProjectStore::create(Project& project) {
+  if (!project.id.isEmpty() && find(project.id)) {
+    return false;  // такой id уже занят
+  }
+  if (project.id.isEmpty()) {
+    project.id = generateId();
+  }
+
+  projects_.push_back(project);
+  save();
+  return true;
+}
+
+bool ProjectStore::update(const String& id, const Project& updated) {
   Project* p = find(id);
   if (!p) {
     return false;
   }
 
   p->title = updated.title;
+  p->tags = updated.tags;
   p->description = updated.description;
   p->githubLink = updated.githubLink;
   p->imageURL = updated.imageURL;
@@ -62,7 +76,7 @@ bool ProjectStore::update(uint32_t id, const Project& updated) {
   return true;
 }
 
-bool ProjectStore::remove(uint32_t id) {
+bool ProjectStore::remove(const String& id) {
   for (auto it = projects_.begin(); it != projects_.end(); ++it) {
     if (it->id == id) {
       projects_.erase(it);
@@ -92,20 +106,11 @@ bool ProjectStore::load() {
   }
 
   projects_.clear();
-  nextId_ = doc["nextId"] | 1u;
-
-  JsonArray arr = doc["projects"].as<JsonArray>();
-  for (JsonObject obj : arr) {
+  for (JsonObjectConst obj : doc["projects"].as<JsonArrayConst>()) {
     Project p;
-    p.id = obj["id"];
-    p.title = obj["title"] | "";
-    p.description = obj["description"] | "";
-    p.githubLink = obj["githubLink"] | "";
-    p.imageURL = obj["imageURL"] | "";
-    projects_.push_back(p);
-
-    if (p.id >= nextId_) {
-      nextId_ = p.id + 1;
+    projectFromJson(obj, p);
+    if (!p.id.isEmpty()) {
+      projects_.push_back(p);
     }
   }
 
@@ -114,16 +119,10 @@ bool ProjectStore::load() {
 
 bool ProjectStore::save() const {
   JsonDocument doc;
-  doc["nextId"] = nextId_;
 
   JsonArray arr = doc["projects"].to<JsonArray>();
   for (const Project& p : projects_) {
-    JsonObject obj = arr.add<JsonObject>();
-    obj["id"] = p.id;
-    obj["title"] = p.title;
-    obj["description"] = p.description;
-    obj["githubLink"] = p.githubLink;
-    obj["imageURL"] = p.imageURL;
+    projectToJson(arr.add<JsonObject>(), p);
   }
 
   // Записываем во временный файл, затем атомарно переименовываем,

@@ -5,9 +5,10 @@
 
 // Программный проект — единица хранения.
 struct Project {
-  uint32_t id = 0;
+  String id;
   String title;
-  String description;
+  std::vector<String> tags;
+  std::vector<String> description;
   String githubLink;
   String imageURL;
 };
@@ -24,24 +25,27 @@ class ProjectStore {
   // Все проекты (в порядке добавления).
   const std::vector<Project>& all() const { return projects_; }
 
-  const Project* find(uint32_t id) const;
-  Project* find(uint32_t id);
+  const Project* find(const String& id) const;
+  Project* find(const String& id);
 
-  // Создаёт проект с автоинкрементным id и сохраняет хранилище.
-  Project create(const String& title, const String& description,
-                 const String& githubLink, const String& imageURL);
+  // Добавляет проект и сохраняет хранилище.
+  // Если у проекта пустой id — генерируется случайный.
+  // Возвращает false, если заданный id уже занят.
+  bool create(Project& project);
 
-  // Полностью заменяет поля существующего проекта и сохраняет хранилище.
-  bool update(uint32_t id, const Project& updated);
+  // Заменяет поля существующего проекта и сохраняет хранилище.
+  bool update(const String& id, const Project& updated);
 
   // Удаляет проект по id и сохраняет хранилище.
-  bool remove(uint32_t id);
+  bool remove(const String& id);
 
  private:
   bool load();
   bool save() const;
 
+  // Случайный 64-битный id в hex, гарантированно свободный.
+  String generateId() const;
+
   std::vector<Project> projects_;
-  uint32_t nextId_ = 1;
   String path_;
 };

@@ -1,9 +1,9 @@
 // REST API сервер портфолио программных проектов.
 //
 // Маршруты:
-//   GET    /projects        -> [ {id, title, description, githubLink, imageURL}, ... ]
+//   GET    /projects        -> [ {id, title, tags, description, githubLink, imageURL}, ... ]
 //   GET    /projects/{id}   -> один проект (404, если нет)
-//   PUT    /projects        -> создать проект (тело без id, сервер выдаёт id) -> 201
+//   PUT    /projects        -> создать проект (id опционален: свой или сгенерированный) -> 201
 //   PUT    /projects/{id}   -> обновить проект (можно передать только часть полей)
 //   DELETE /projects/{id}   -> удалить проект -> 204
 //
@@ -18,6 +18,7 @@
 
 #include <ArduinoJson.h>
 
+#include "ProjectJson.h"
 #include "ProjectStore.h"
 #include "wifi_credentials.h"
 
@@ -54,11 +55,7 @@ String errorJson(const char* message) {
 
 String serializeProject(const Project& p) {
   JsonDocument doc;
-  doc["id"] = p.id;
-  doc["title"] = p.title;
-  doc["description"] = p.description;
-  doc["githubLink"] = p.githubLink;
-  doc["imageURL"] = p.imageURL;
+  projectToJson(doc.to<JsonObject>(), p);
   String out;
   serializeJson(doc, out);
   return out;
@@ -68,21 +65,16 @@ String serializeProjects() {
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
   for (const Project& p : store.all()) {
-    JsonObject obj = arr.add<JsonObject>();
-    obj["id"] = p.id;
-    obj["title"] = p.title;
-    obj["description"] = p.description;
-    obj["githubLink"] = p.githubLink;
-    obj["imageURL"] = p.imageURL;
+    projectToJson(arr.add<JsonObject>(), p);
   }
   String out;
   serializeJson(doc, out);
   return out;
 }
 
-// Извлекает числовой id из URI вида /projects/123.
-// Возвращает false, если формат не подходит.
-bool parseId(const String& uri, uint32_t& id) {
+// Извлекает id (строку) из URI вида /projects/{id}.
+// Возвращает false, если id пустой или содержит лишние сегменты пути.
+bool parseId(const String& uri, String& id) {
   const char* prefix = "/projects/";
   if (!uri.startsWith(prefix)) {
     return false;
@@ -92,18 +84,12 @@ bool parseId(const String& uri, uint32_t& id) {
   if (tail.isEmpty() || tail.indexOf('/') >= 0) {
     return false;
   }
-  for (char c : tail) {
-    if (!isdigit(static_cast<unsigned char>(c))) {
-      return false;
-    }
-  }
 
-  id = strtoul(tail.c_str(), nullptr, 10);
+  id = tail;
   return true;
 }
 
-// Разбирает тело запроса в проект. Поле id игнорируется — его выдаёт
-// сервер. Пропущенные строковые поля становятся пустыми строками.
+// Разбирает тело запроса в проект целиком (включая id).
 bool parseProjectBody(const String& body, Project& out) {
   JsonDocument doc;
   if (deserializeJson(doc, body)) {
@@ -113,16 +99,13 @@ bool parseProjectBody(const String& body, Project& out) {
     return false;
   }
 
-  out.title = doc["title"] | "";
-  out.description = doc["description"] | "";
-  out.githubLink = doc["githubLink"] | "";
-  out.imageURL = doc["imageURL"] | "";
-  out.title.trim();
+  projectFromJson(doc.as<JsonObjectConst>(), out);
   return true;
 }
 
 // Применяет к существующему проекту только те поля, которые реально
-// переданы в теле запроса (null-поля не трогают текущее значение).
+// переданы в теле запроса (отсутствующие поля сохраняют текущее значение).
+// id телом запроса не меняется — он берётся из URL.
 bool applyProjectUpdate(const Project& base, const String& body,
                         Project& out) {
   JsonDocument doc;
@@ -133,12 +116,24 @@ bool applyProjectUpdate(const Project& base, const String& body,
     return false;
   }
 
+  JsonObjectConst obj = doc.as<JsonObjectConst>();
   out = base;
-  if (!doc["title"].isNull()) out.title = doc["title"] | "";
-  if (!doc["description"].isNull()) out.description = doc["description"] | "";
-  if (!doc["githubLink"].isNull()) out.githubLink = doc["githubLink"] | "";
-  if (!doc["imageURL"].isNull()) out.imageURL = doc["imageURL"] | "";
-  out.title.trim();
+
+  if (!obj["title"].isNull()) {
+    out.title = obj["title"] | "";
+    out.title.trim();
+  }
+  if (!obj["tags"].isNull()) {
+    out.tags.clear();
+    readStringArray(obj["tags"], out.tags);
+  }
+  if (!obj["description"].isNull()) {
+    out.description.clear();
+    readStringArray(obj["description"], out.description);
+  }
+  if (!obj["githubLink"].isNull()) out.githubLink = obj["githubLink"] | "";
+  if (!obj["imageURL"].isNull()) out.imageURL = obj["imageURL"] | "";
+
   return !out.title.isEmpty();
 }
 
@@ -151,20 +146,24 @@ void handleGetProjects() {
 void handleCreateProject() {
   Project p;
   if (!parseProjectBody(server.arg("plain"), p) || p.title.isEmpty()) {
-    sendJson(400, errorJson(
-        "Invalid body: expected JSON object with fields "
-        "title, description, githubLink, imageURL"));
+    sendJson(400,
+             errorJson("Invalid body: expected JSON object with fields "
+                       "id (optional), title, tags, description, githubLink, "
+                       "imageURL"));
     return;
   }
 
-  Project created =
-      store.create(p.title, p.description, p.githubLink, p.imageURL);
-  Serial.printf("[API] created project #%u: %s\n", created.id,
-                created.title.c_str());
-  sendJson(201, serializeProject(created));
+  if (!store.create(p)) {
+    sendJson(409, errorJson("Project with this id already exists"));
+    return;
+  }
+
+  Serial.printf("[API] created project %s: %s\n", p.id.c_str(),
+                p.title.c_str());
+  sendJson(201, serializeProject(p));
 }
 
-void handleProjectById(uint32_t id) {
+void handleProjectById(const String& id) {
   switch (server.method()) {
     case HTTP_GET: {
       const Project* p = store.find(id);
@@ -185,14 +184,14 @@ void handleProjectById(uint32_t id) {
 
       Project updated;
       if (!applyProjectUpdate(*existing, server.arg("plain"), updated)) {
-        sendJson(400, errorJson(
-            "Invalid body: expected JSON object with fields "
-            "title, description, githubLink, imageURL"));
+        sendJson(400,
+                 errorJson("Invalid body: expected JSON object with fields "
+                           "title, tags, description, githubLink, imageURL"));
         return;
       }
 
       store.update(id, updated);
-      Serial.printf("[API] updated project #%u\n", id);
+      Serial.printf("[API] updated project %s\n", id.c_str());
       sendJson(200, serializeProject(updated));
       return;
     }
@@ -202,7 +201,7 @@ void handleProjectById(uint32_t id) {
         sendJson(404, errorJson("Project not found"));
         return;
       }
-      Serial.printf("[API] deleted project #%u\n", id);
+      Serial.printf("[API] deleted project %s\n", id.c_str());
       sendNoContent();
       return;
     }
@@ -221,7 +220,7 @@ void handleNotFound() {
   }
 
   // Динамические маршруты /projects/{id}.
-  uint32_t id;
+  String id;
   if (parseId(server.uri(), id)) {
     handleProjectById(id);
     return;
@@ -234,6 +233,7 @@ void handleNotFound() {
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
 
   if (!store.begin()) {
     Serial.println("[store] LittleFS mount failed");
