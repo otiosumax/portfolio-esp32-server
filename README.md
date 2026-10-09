@@ -1,9 +1,9 @@
 # Portfolio Server
 
-REST API сервер на ESP32-S3 (Freenove ESP32 S3 WROOM, Arduino framework),
-хранящий информацию о программных проектах. Данные лежат в файле
-`/projects.json` в LittleFS (флеш-память), поэтому переживают перезагрузку
-и отключение питания.
+REST API сервер на ESP32-S3 (Freenove ESP32 S3 WROOM, Arduino framework,
+асинхронный веб-сервер ESPAsyncWebServer), хранящий информацию о программных
+проектах. Данные лежат в файле `/projects.json` в LittleFS (флеш-память),
+поэтому переживают перезагрузку и отключение питания.
 
 ## Быстрый старт
 
@@ -30,6 +30,7 @@ REST API сервер на ESP32-S3 (Freenove ESP32 S3 WROOM, Arduino framework)
 | `PUT`              | `/projects/:id` | Обновить проект (можно частично)         | 200   |
 | `DELETE`           | `/projects/:id` | Удалить проект                           | 204   |
 | `GET`              | `/storage`    | Загруженность флеш-памяти                  | 200   |
+| `GET`              | `/events`     | SSE-поток событий об изменениях            | 200   |
 
 Ошибки: `400` — невалидное тело или недопустимый `id`, `404` — проект/путь
 не найден, `405` — метод не поддерживается, `409` — id уже занят при
@@ -53,9 +54,8 @@ type Project = {
   передавать: тогда сервер сгенерирует случайный (hex). Если передать свой `id`
   и он уже занят — вернётся `409`; если в `id` есть другие символы — `400`.
 - При создании обязателен только `title`.
-- При обновлении передаются только изменяемые поля; для массивов `tags` и
-  `description` присланное значение заменяет массив целиком, отсутствующие поля
-  сохраняются.
+- При обновлении передаются только изменяемые поля; `tags` заменяется целиком,
+  `description` перезаписывается строкой, отсутствующие поля сохраняются.
 - `id` через тело запроса не меняется — он берётся из URL.
 - Строковые поля — произвольный UTF-8, включая кириллицу. Ответы отдаются
   с `Content-Type: application/json; charset=utf-8`.
@@ -89,7 +89,8 @@ type Project = {
   "freeHeapBytes": 291000,
   "minFreeHeapBytes": 284500,
   "maxAllocHeapBytes": 110000,
-  "requestBodyLimitBytes": 16384
+  "requestBodyLimitBytes": 16384,
+  "sseClients": 1
 }
 ```
 
@@ -101,6 +102,32 @@ type Project = {
 - Когда свободного места перестаёт хватать на запись файла данных, операции
   создания/обновления/удаления возвращают `507`, а изменение откатывается —
   в памяти и в файле остаётся прежнее согласованное состояние.
+
+### SSE-поток событий
+
+`GET /events` — Server-Sent Events: сервер держит соединение открытым и
+отправляет события при каждом изменении данных. Подключение из браузера:
+
+```js
+const es = new EventSource('http://portfolio-server.local/events');
+
+es.addEventListener('project-created', e =>
+  console.log('created', JSON.parse(e.data)));
+es.addEventListener('project-updated', e =>
+  console.log('updated', JSON.parse(e.data)));
+es.addEventListener('project-deleted', e =>
+  console.log('deleted', JSON.parse(e.data)));
+```
+
+| Событие           | `data`                        |
+| ----------------- | ----------------------------- |
+| `project-created` | JSON созданного проекта       |
+| `project-updated` | JSON обновлённого проекта     |
+| `project-deleted` | `{"id":"..."}`                |
+| `ping`            | пусто (heartbeat каждые ~15 с) |
+
+CORS включён, так что `EventSource` можно открывать с другого origin.
+Проверка из консоли: `curl -N http://portfolio-server.local/events`.
 
 ## Примеры (curl)
 

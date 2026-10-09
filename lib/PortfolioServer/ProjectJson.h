@@ -18,7 +18,7 @@ inline bool isAsciiSpace(char c) {
 }
 
 // Обрезает только пробелы по краям, не задевая UTF-8-символы.
-inline void trimAscii(String &s) {
+inline void trimAscii(String& s) {
   unsigned int begin = 0;
   unsigned int end = s.length();
   while (begin < end && isAsciiSpace(s[begin])) {
@@ -33,7 +33,7 @@ inline void trimAscii(String &s) {
 }
 
 // id допускает только латиницу и цифры (a-z, A-Z, 0-9) и непустой.
-inline bool isValidId(const String &id) {
+inline bool isValidId(const String& id) {
   if (id.isEmpty()) {
     return false;
   }
@@ -48,8 +48,8 @@ inline bool isValidId(const String &id) {
   return true;
 }
 
-// Копирует непустые строки из JSON-массива в вектор.
-inline void readStringArray(JsonVariantConst value, std::vector<String> &out) {
+// Копирует непустые строки из JSON-массива в вектор (tags).
+inline void readStringArray(JsonVariantConst value, std::vector<String>& out) {
   for (JsonVariantConst item : value.as<JsonArrayConst>()) {
     String s = item.as<String>();
     trimAscii(s);
@@ -59,30 +59,49 @@ inline void readStringArray(JsonVariantConst value, std::vector<String> &out) {
   }
 }
 
+// Читает description. Принимает как строку, так и устаревший формат
+// массива строк (склеивает через '\n') — чтобы не потерять данные,
+// сохранённые старыми версиями прошивки в LittleFS.
+inline void readDescription(JsonVariantConst value, String& out) {
+  if (value.is<JsonArrayConst>()) {
+    String joined;
+    for (JsonVariantConst item : value.as<JsonArrayConst>()) {
+      const String line = item.as<String>();
+      if (!joined.isEmpty()) {
+        joined += '\n';
+      }
+      joined += line;
+    }
+    out = joined;
+  } else {
+    out = value.as<String>();
+  }
+  trimAscii(out);
+}
+
 // Сериализует проект в JSON-объект формата API.
-inline void projectToJson(JsonObject obj, const Project &p) {
+inline void projectToJson(JsonObject obj, const Project& p) {
   obj["id"] = p.id;
   obj["title"] = p.title;
 
   JsonArray tags = obj["tags"].to<JsonArray>();
-  for (const String &tag : p.tags) {
+  for (const String& tag : p.tags) {
     tags.add(tag);
   }
 
   obj["description"] = p.description;
-
   obj["githubLink"] = p.githubLink;
   obj["imageURL"] = p.imageURL;
 }
 
 // Читает все поля проекта из JSON-объекта (включая id).
-inline void projectFromJson(JsonObjectConst obj, Project &p) {
+inline void projectFromJson(JsonObjectConst obj, Project& p) {
   p.id = obj["id"] | "";
   trimAscii(p.id);
   p.title = obj["title"] | "";
   trimAscii(p.title);
   readStringArray(obj["tags"], p.tags);
-  p.description = obj["description"] | "";
+  readDescription(obj["description"], p.description);
   p.githubLink = obj["githubLink"] | "";
   p.imageURL = obj["imageURL"] | "";
 }
