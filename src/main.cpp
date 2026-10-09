@@ -1,30 +1,30 @@
-// REST API сервер портфолио программных проектов.
+// REST API сервер портфолио программных проектов (асинхронный, ESPAsyncWebServer).
 //
 // Маршруты:
-//   GET    /projects        -> [ {id, title, tags, description, githubLink,
-//   imageURL}, ... ] GET    /projects/{id}   -> один проект (404, если нет) PUT
-//   /projects        -> создать проект (id опционален: свой или
-//   сгенерированный) -> 201 PUT    /projects/{id}   -> обновить проект (можно
-//   передать только часть полей) DELETE /projects/{id}   -> удалить проект ->
-//   204 GET    /storage         -> загруженность флеш-памяти и кучи
+//   GET    /projects        -> [ {id, title, tags, description, githubLink, imageURL}, ... ]
+//   GET    /projects/{id}   -> один проект (404, если нет)
+//   PUT    /projects        -> создать проект (id опционален: свой или сгенерированный) -> 201
+//   PUT    /projects/{id}   -> обновить проект (можно передать только часть полей)
+//   DELETE /projects/{id}   -> удалить проект -> 204
+//   GET    /storage         -> загруженность флеш-памяти и кучи
+//   GET    /events          -> SSE-поток событий об изменениях
 //
-// id проекта допускает только латиницу и цифры (a-z, A-Z, 0-9).
+// SSE-события:
+//   project-created / project-updated / project-deleted (data = JSON проекта)
+//   ping (heartbeat каждые ~15 секунд)
+//
+// id допускает только латиницу и цифры (a-z, A-Z, 0-9).
 // Текстовые поля — произвольный UTF-8 (в т.ч. кириллица); ответы отдаются
 // с Content-Type: application/json; charset=utf-8.
-//
-// Защита ресурсов:
-//   * Тело запроса читается порциями и не превышает kMaxRequestBodyBytes —
-//     иначе 413, но RAM под большой payload не выделяется целиком.
-//   * При нехватке места на флеше изменение откатывается -> 507.
 //
 // Данные хранятся в файле /projects.json в LittleFS (флеш-память),
 // поэтому переживают перезагрузку и отключение питания.
 
 #include <Arduino.h>
+#include <ESPAsyncWebServer.h>
+#include <WiFi.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
-#include <WebServer.h>
-#include <WiFi.h>
 
 #include <ArduinoJson.h>
 
@@ -32,37 +32,31 @@
 #include "ProjectStore.h"
 #include "wifi_credentials.h"
 
-// Максимальный размер тела PUT-запроса. Тело тянется порциями через
-// raw-механизм WebServer, поэтому даже огромный Content-Length не приведёт
-// к аллокации всей памяти: лишнее отбрасывается, клиент получает 413.
+// Максимальный размер тела запроса. Тело собирается в буфер, привязанный
+// к запросу, и не превышает лимит: при превышении клиент получает 413,
+// а лишние байты не занимают RAM.
 static const size_t kMaxRequestBodyBytes = 16 * 1024;
 
-WebServer server(80);
+// Интервал SSE-heartbeat (поддерживает соединение и NAT-таблицы живыми).
+static const uint32_t kSseHeartbeatMs = 15000;
+
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
 ProjectStore store;
+
+uint32_t lastHeartbeatMs = 0;
 
 // --- Вспомогательные функции ---------------------------------------------
 
-// CORS-заголовки, чтобы к API мог обращаться фронтенд с другого origin.
-void addCorsHeaders() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods",
-                    "GET, PUT, DELETE, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+void sendJson(AsyncWebServerRequest* request, int code, const String& body) {
+  request->send(code, "application/json; charset=utf-8", body);
 }
 
-void sendJson(int code, const String &body) {
-  addCorsHeaders();
-  // charset обязателен: без него клиенты декодируют ответ в системной
-  // кодировке и кириллица превращается в «кракозябры».
-  server.send(code, "application/json; charset=utf-8", body);
+void sendNoContent(AsyncWebServerRequest* request) {
+  request->send(204);
 }
 
-void sendNoContent() {
-  addCorsHeaders();
-  server.send(204);
-}
-
-String errorJson(const char *message) {
+String errorJson(const char* message) {
   JsonDocument doc;
   doc["error"] = message;
   String out;
@@ -70,30 +64,30 @@ String errorJson(const char *message) {
   return out;
 }
 
-// Преобразует результат операции хранилища в HTTP-ответ.
-void sendStoreError(StoreResult result) {
+void sendStoreError(AsyncWebServerRequest* request, StoreResult result) {
   switch (result) {
-  case StoreResult::NotFound:
-    sendJson(404, errorJson("Project not found"));
-    return;
-  case StoreResult::DuplicateId:
-    sendJson(409, errorJson("Project with this id already exists"));
-    return;
-  case StoreResult::StorageFull:
-    sendJson(507, errorJson("Insufficient storage: not enough free space"));
-    return;
-  default:
-    sendJson(500, errorJson("Unexpected storage error"));
-    return;
+    case StoreResult::NotFound:
+      sendJson(request, 404, errorJson("Project not found"));
+      return;
+    case StoreResult::DuplicateId:
+      sendJson(request, 409, errorJson("Project with this id already exists"));
+      return;
+    case StoreResult::StorageFull:
+      sendJson(request, 507,
+               errorJson("Insufficient storage: not enough free space"));
+      return;
+    default:
+      sendJson(request, 500, errorJson("Unexpected storage error"));
+      return;
   }
 }
 
-void sendInvalidId() {
-  sendJson(400, errorJson("Invalid id: only latin letters and digits are "
-                          "allowed"));
+void sendInvalidId(AsyncWebServerRequest* request) {
+  sendJson(request, 400,
+           errorJson("Invalid id: only latin letters and digits are allowed"));
 }
 
-String serializeProject(const Project &p) {
+String serializeProject(const Project& p) {
   JsonDocument doc;
   projectToJson(doc.to<JsonObject>(), p);
   String out;
@@ -104,7 +98,7 @@ String serializeProject(const Project &p) {
 String serializeProjects() {
   JsonDocument doc;
   JsonArray arr = doc.to<JsonArray>();
-  for (const Project &p : store.all()) {
+  for (const Project& p : store.all()) {
     projectToJson(arr.add<JsonObject>(), p);
   }
   String out;
@@ -114,14 +108,14 @@ String serializeProjects() {
 
 // Результат разбора URI вида /projects/{id}.
 enum class IdParse {
-  NotProjectId, // URI не похож на /projects/{id}
-  Invalid,      // id есть, но содержит недопустимые символы
-  Ok,           // id корректен (см. isValidId)
+  NotProjectId,  // URI не похож на /projects/{id}
+  Invalid,       // id есть, но содержит недопустимые символы
+  Ok,            // id корректен (см. isValidId)
 };
 
 // Извлекает id (только латиница и цифры) из URI вида /projects/{id}.
-IdParse parseProjectId(const String &uri, String &id) {
-  const char *prefix = "/projects/";
+IdParse parseProjectId(const String& uri, String& id) {
+  const char* prefix = "/projects/";
   if (!uri.startsWith(prefix)) {
     return IdParse::NotProjectId;
   }
@@ -139,7 +133,7 @@ IdParse parseProjectId(const String &uri, String &id) {
 }
 
 // Разбирает тело запроса в проект целиком (включая id).
-bool parseProjectBody(const String &body, Project &out) {
+bool parseProjectBody(const String& body, Project& out) {
   JsonDocument doc;
   if (deserializeJson(doc, body)) {
     return false;
@@ -155,7 +149,8 @@ bool parseProjectBody(const String &body, Project &out) {
 // Применяет к существующему проекту только те поля, которые реально
 // переданы в теле запроса (отсутствующие поля сохраняют текущее значение).
 // id телом запроса не меняется — он берётся из URL.
-bool applyProjectUpdate(const Project &base, const String &body, Project &out) {
+bool applyProjectUpdate(const Project& base, const String& body,
+                        Project& out) {
   JsonDocument doc;
   if (deserializeJson(doc, body)) {
     return false;
@@ -176,13 +171,10 @@ bool applyProjectUpdate(const Project &base, const String &body, Project &out) {
     readStringArray(obj["tags"], out.tags);
   }
   if (!obj["description"].isNull()) {
-    out.description.clear();
-    trimAscii(out.description);
+    readDescription(obj["description"], out.description);
   }
-  if (!obj["githubLink"].isNull())
-    out.githubLink = obj["githubLink"] | "";
-  if (!obj["imageURL"].isNull())
-    out.imageURL = obj["imageURL"] | "";
+  if (!obj["githubLink"].isNull()) out.githubLink = obj["githubLink"] | "";
+  if (!obj["imageURL"].isNull()) out.imageURL = obj["imageURL"] | "";
 
   return !out.title.isEmpty();
 }
@@ -190,117 +182,88 @@ bool applyProjectUpdate(const Project &base, const String &body, Project &out) {
 // --- Ограниченный приём тела запроса --------------------------------------
 
 // Вызывается, когда тело запроса полностью прочитано (или превысило лимит).
-using BodyRequestCallback = void (*)(HTTPMethod method, const String &uri,
-                                     const String &body, bool overflow);
+using BodyRequestCallback = void (*)(AsyncWebServerRequest* request,
+                                     const String& body, bool overflow);
 
-void handleBodyRequest(HTTPMethod method, const String &uri, const String &body,
+void handleBodyRequest(AsyncWebServerRequest* request, const String& body,
                        bool overflow);
 
-// Обработчик методов с телом (PUT/POST/PATCH/DELETE) на путях /projects... .
-// В отличие от стандартного FunctionRequestHandler, тело не буферизуется
-// целиком: WebServer отдаёт его порциями в raw(), а мы храним не больше
-// kMaxRequestBodyBytes. При превышении лимита тело отбрасывается, а запрос
-// получает 413 — без риска исчерпать RAM.
-class BoundedBodyHandler : public RequestHandler {
-public:
-  BoundedBodyHandler(const char *prefix, size_t maxBytes,
+// Обработчик методов с телом на путях /projects... . Тело собирается порциями
+// в буфер, привязанный к конкретному запросу (request->_tempObject), поэтому
+// параллельные запросы не мешают друг другу, а объём не превышает
+// kMaxRequestBodyBytes — лишнее не копируется, клиент получает 413.
+class ProjectBodyHandler : public AsyncWebHandler {
+ public:
+  ProjectBodyHandler(const String& prefix, size_t maxBytes,
                      BodyRequestCallback callback)
       : prefix_(prefix), maxBytes_(maxBytes), callback_(callback) {}
 
-  bool canHandle(HTTPMethod method, String uri) override {
-    if (!matches(uri)) {
+  bool canHandle(AsyncWebServerRequest* request) override {
+    if (!(request->method() & (HTTP_POST | HTTP_PUT | HTTP_PATCH |
+                               HTTP_DELETE))) {
       return false;
     }
-    return method == HTTP_POST || method == HTTP_PUT || method == HTTP_PATCH ||
-           method == HTTP_DELETE;
+    const String& url = request->url();
+    return url == prefix_ || url.startsWith(prefix_ + "/");
   }
 
-  // Просим WebServer стримить тело вместо буферизации.
-  bool canRaw(String uri) override { return matches(uri); }
+  // Просим ядро отдавать нам порции тела, а не отбрасывать их.
+  bool isRequestHandlerTrivial() override { return false; }
 
-  void raw(WebServer &server, String requestUri, HTTPRaw &raw) override {
-    switch (raw.status) {
-    case RAW_START:
-      body_ = "";
-      overflow_ = false;
-      responded_ = false;
-      // Заранее известный объём больше лимита — даже не копим.
-      if (server.clientContentLength() > 0 &&
-          static_cast<size_t>(server.clientContentLength()) > maxBytes_) {
-        overflow_ = true;
-      }
-      break;
-
-    case RAW_WRITE:
-      if (overflow_) {
-        break; // лишнее просто отбрасываем
-      }
-      if (body_.length() + raw.currentSize <= maxBytes_) {
-        body_.concat(reinterpret_cast<const char *>(raw.buf),
-                     static_cast<unsigned int>(raw.currentSize));
-      } else {
-        overflow_ = true;
-        body_ = ""; // Content-Length соврал — не храним мусор
-      }
-      break;
-
-    case RAW_ABORTED:
-      // Тело не догрузилось: handle() уже не вызовется, отвечаем здесь.
-      if (!responded_) {
-        sendJson(overflow_ ? 413 : 400,
-                 errorJson(overflow_ ? "Request body too large"
-                                     : "Incomplete request body"));
-        responded_ = true;
-      }
-      break;
-
-    default:
-      break;
+  void handleBody(AsyncWebServerRequest* request, uint8_t* data, size_t len,
+                  size_t index, size_t total) override {
+    if (total > maxBytes_) {
+      return;  // заведомо больше лимита — не копим, в handleRequest отдадим 413
     }
+    if (request->_tempObject == nullptr) {
+      request->_tempObject = malloc(total + 1);
+      if (request->_tempObject == nullptr) {
+        return;  // не хватило кучи — тело останется пустым, клиент получит 400
+      }
+    }
+    memcpy(static_cast<uint8_t*>(request->_tempObject) + index, data, len);
   }
 
-  bool handle(WebServer &server, HTTPMethod method,
-              String requestUri) override {
-    if (responded_) {
-      return true;
+  void handleRequest(AsyncWebServerRequest* request) override {
+    const size_t total = request->contentLength();
+    const bool overflow = total > maxBytes_;
+
+    String body;
+    if (request->_tempObject != nullptr) {
+      if (!overflow) {
+        uint8_t* buf = static_cast<uint8_t*>(request->_tempObject);
+        buf[total] = 0;
+        body = reinterpret_cast<const char*>(buf);
+      }
+      free(request->_tempObject);
+      request->_tempObject = nullptr;
     }
-    callback_(method, requestUri, body_, overflow_);
-    return true;
+
+    callback_(request, body, overflow);
   }
 
-private:
-  bool matches(const String &uri) const {
-    if (!uri.startsWith(prefix_)) {
-      return false;
-    }
-    if (uri.length() == prefix_.length()) {
-      return true;
-    }
-    return uri[prefix_.length()] == '/';
-  }
-
+ private:
   String prefix_;
   size_t maxBytes_;
   BodyRequestCallback callback_;
-  String body_;
-  bool overflow_ = false;
-  bool responded_ = false;
 };
 
 // --- Обработчики маршрутов -------------------------------------------------
 
-void handleGetProjects() { sendJson(200, serializeProjects()); }
+void handleGetProjects(AsyncWebServerRequest* request) {
+  sendJson(request, 200, serializeProjects());
+}
 
-void handleGetStorage() {
+void handleGetStorage(AsyncWebServerRequest* request) {
   const StorageStats s = store.stats();
 
   JsonDocument doc;
   doc["totalBytes"] = s.totalBytes;
   doc["usedBytes"] = s.usedBytes;
   doc["freeBytes"] = s.freeBytes;
-  doc["usedPercent"] =
-      s.totalBytes ? static_cast<uint32_t>(100ULL * s.usedBytes / s.totalBytes)
-                   : 0;
+  doc["usedPercent"] = s.totalBytes ? static_cast<uint32_t>(
+                                          100ULL * s.usedBytes / s.totalBytes)
+                                    : 0;
   doc["projectCount"] = s.projectCount;
   doc["dataFile"] = store.dataPath();
   doc["dataFileBytes"] = s.dataFileBytes;
@@ -310,36 +273,38 @@ void handleGetStorage() {
   doc["minFreeHeapBytes"] = ESP.getMinFreeHeap();
   doc["maxAllocHeapBytes"] = ESP.getMaxAllocHeap();
   doc["requestBodyLimitBytes"] = kMaxRequestBodyBytes;
+  doc["sseClients"] = events.count();
 
   String out;
   serializeJson(doc, out);
-  sendJson(200, out);
+  sendJson(request, 200, out);
 }
 
-void handleGetProject(const String &id) {
-  const Project *p = store.find(id);
+void handleGetProject(AsyncWebServerRequest* request, const String& id) {
+  const Project* p = store.find(id);
   if (!p) {
-    sendJson(404, errorJson("Project not found"));
+    sendJson(request, 404, errorJson("Project not found"));
     return;
   }
-  sendJson(200, serializeProject(*p));
+  sendJson(request, 200, serializeProject(*p));
 }
 
-// Диспетчер для методов с телом (см. BoundedBodyHandler).
-void handleBodyRequest(HTTPMethod method, const String &uri, const String &body,
+// Диспетчер для методов с телом (см. ProjectBodyHandler).
+void handleBodyRequest(AsyncWebServerRequest* request, const String& body,
                        bool overflow) {
   if (overflow) {
-    sendJson(413, errorJson("Request body too large"));
+    sendJson(request, 413, errorJson("Request body too large"));
     return;
   }
 
-  switch (method) {
-  case HTTP_PUT: {
+  if (request->method() == HTTP_PUT) {
+    const String& url = request->url();
+
     // PUT /projects -> создание.
-    if (uri == "/projects") {
+    if (url == "/projects") {
       Project p;
       if (!parseProjectBody(body, p) || p.title.isEmpty()) {
-        sendJson(400,
+        sendJson(request, 400,
                  errorJson("Invalid body: expected JSON object with fields "
                            "id (optional), title, tags, description, "
                            "githubLink, imageURL"));
@@ -348,44 +313,46 @@ void handleBodyRequest(HTTPMethod method, const String &uri, const String &body,
 
       // Если id задан клиентом — он должен быть из латиницы и цифр.
       if (!p.id.isEmpty() && !isValidId(p.id)) {
-        sendInvalidId();
+        sendInvalidId(request);
         return;
       }
 
       const StoreResult result = store.create(p);
       if (result != StoreResult::Ok) {
-        sendStoreError(result);
+        sendStoreError(request, result);
         return;
       }
 
       Serial.printf("[API] created project %s: %s\n", p.id.c_str(),
                     p.title.c_str());
-      sendJson(201, serializeProject(p));
+      const String payload = serializeProject(p);
+      events.send(payload.c_str(), "project-created", millis());
+      sendJson(request, 201, payload);
       return;
     }
 
     // PUT /projects/{id} -> обновление.
     String id;
-    switch (parseProjectId(uri, id)) {
-    case IdParse::Ok:
-      break;
-    case IdParse::Invalid:
-      sendInvalidId();
-      return;
-    default:
-      sendJson(404, errorJson("Not found"));
-      return;
+    switch (parseProjectId(url, id)) {
+      case IdParse::Ok:
+        break;
+      case IdParse::Invalid:
+        sendInvalidId(request);
+        return;
+      default:
+        sendJson(request, 404, errorJson("Not found"));
+        return;
     }
 
-    const Project *existing = store.find(id);
+    const Project* existing = store.find(id);
     if (!existing) {
-      sendJson(404, errorJson("Project not found"));
+      sendJson(request, 404, errorJson("Project not found"));
       return;
     }
 
     Project updated;
     if (!applyProjectUpdate(*existing, body, updated)) {
-      sendJson(400,
+      sendJson(request, 400,
                errorJson("Invalid body: expected JSON object with fields "
                          "title, tags, description, githubLink, imageURL"));
       return;
@@ -393,66 +360,70 @@ void handleBodyRequest(HTTPMethod method, const String &uri, const String &body,
 
     const StoreResult result = store.update(id, updated);
     if (result != StoreResult::Ok) {
-      sendStoreError(result);
+      sendStoreError(request, result);
       return;
     }
 
     Serial.printf("[API] updated project %s\n", id.c_str());
-    sendJson(200, serializeProject(updated));
+    const String payload = serializeProject(updated);
+    events.send(payload.c_str(), "project-updated", millis());
+    sendJson(request, 200, payload);
     return;
   }
 
-  case HTTP_DELETE: {
+  if (request->method() == HTTP_DELETE) {
     String id;
-    switch (parseProjectId(uri, id)) {
-    case IdParse::Ok:
-      break;
-    case IdParse::Invalid:
-      sendInvalidId();
-      return;
-    default:
-      sendJson(405, errorJson("Method not allowed"));
-      return;
+    switch (parseProjectId(request->url(), id)) {
+      case IdParse::Ok:
+        break;
+      case IdParse::Invalid:
+        sendInvalidId(request);
+        return;
+      default:
+        sendJson(request, 405, errorJson("Method not allowed"));
+        return;
     }
 
     const StoreResult result = store.remove(id);
     if (result != StoreResult::Ok) {
-      sendStoreError(result);
+      sendStoreError(request, result);
       return;
     }
 
     Serial.printf("[API] deleted project %s\n", id.c_str());
-    sendNoContent();
+    JsonDocument doc;
+    doc["id"] = id;
+    String payload;
+    serializeJson(doc, payload);
+    events.send(payload.c_str(), "project-deleted", millis());
+    sendNoContent(request);
     return;
   }
 
-  default:
-    sendJson(405, errorJson("Method not allowed"));
-    return;
-  }
+  sendJson(request, 405, errorJson("Method not allowed"));
 }
 
-void handleNotFound() {
+void handleNotFound(AsyncWebServerRequest* request) {
   // Ответ на CORS preflight (OPTIONS) для любого пути.
-  if (server.method() == HTTP_OPTIONS) {
-    sendNoContent();
+  if (request->method() == HTTP_OPTIONS) {
+    sendNoContent(request);
     return;
   }
 
   // Динамические маршруты /projects/{id} (GET).
   String id;
-  switch (parseProjectId(server.uri(), id)) {
-  case IdParse::Ok:
-    handleGetProject(id);
-    return;
-  case IdParse::Invalid:
-    sendInvalidId();
-    return;
-  default:
-    break;
+  switch (parseProjectId(request->url(), id)) {
+    case IdParse::Ok:
+      handleGetProject(request, id);
+      return;
+    case IdParse::Invalid:
+      sendInvalidId(request);
+      return;
+    default:
+      break;
   }
 
-  sendJson(404, errorJson("Not found"));
+  sendJson(request, 404, errorJson("Not found"));
 }
 
 // --- Запуск ------------------------------------------------------------------
@@ -485,15 +456,36 @@ void setup() {
     Serial.println("[mdns] failed to start");
   }
 
+  // CORS для всех ответов (в т.ч. SSE-потока и preflight).
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods",
+                                       "GET, PUT, DELETE, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers",
+                                       "Content-Type");
+
   server.on("/projects", HTTP_GET, handleGetProjects);
   server.on("/storage", HTTP_GET, handleGetStorage);
-  // PUT/DELETE обрабатываются ограниченным по памяти обработчиком.
-  server.addHandler(new BoundedBodyHandler("/projects", kMaxRequestBodyBytes,
+  server.addHandler(new ProjectBodyHandler("/projects", kMaxRequestBodyBytes,
                                            handleBodyRequest));
+  server.addHandler(&events);
   server.onNotFound(handleNotFound);
+
+  events.onConnect([](AsyncEventSource* source, AsyncEventSourceClient* client) {
+    (void)client;
+    Serial.printf("[sse] client connected (total %u)\n",
+                  static_cast<unsigned>(source->count()));
+  });
+  events.onDisconnect(
+      [](AsyncEventSource* source, AsyncEventSourceClient* client) {
+        (void)client;
+        Serial.printf("[sse] client disconnected (total %u)\n",
+                      static_cast<unsigned>(source->count()));
+      });
+
   server.begin();
 
   Serial.printf("[server] ready at http://%s.local/projects\n", HOSTNAME);
+  Serial.printf("[sse] events stream at http://%s.local/events\n", HOSTNAME);
 }
 
 void loop() {
@@ -501,6 +493,13 @@ void loop() {
     WiFi.reconnect();
     delay(500);
   }
-  server.handleClient();
+
+  // SSE heartbeat: держит соединение и NAT-таблицы живыми.
+  const uint32_t now = millis();
+  if (now - lastHeartbeatMs >= kSseHeartbeatMs) {
+    lastHeartbeatMs = now;
+    events.send("", "ping", now);
+  }
+
   delay(2);
 }
